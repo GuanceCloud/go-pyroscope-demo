@@ -10,10 +10,10 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,16 +23,52 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
-	"gopkg.in/DataDog/dd-trace-go.v1/profiler"
+	"github.com/google/uuid"
+	otelpyroscope "github.com/grafana/otel-profiling-go"
+	"github.com/grafana/pyroscope-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
-const BaseServiceName = "go-profiling-demo"
+var UUID = uuid.NewString()
+var otelTracer trace.Tracer
 
-type ctxKeyStruct struct {
+type OtelTraceWrapper struct {
+	trace.Span
+	SpanCtx          context.Context
+	PreviousPProfCTx context.Context
 }
 
-var serviceNameKey = ctxKeyStruct{}
+func (d *OtelTraceWrapper) Finish() {
+	d.Span.End()
+	if d.PreviousPProfCTx != nil {
+		pprof.SetGoroutineLabels(d.PreviousPProfCTx)
+	}
+}
+
+// StartSpanFromContext otel span wrapper
+func StartSpanFromContext(ctx context.Context, operationName string, opts ...trace.SpanStartOption) *OtelTraceWrapper {
+	wrapper := new(OtelTraceWrapper)
+	wrapper.SpanCtx, wrapper.Span = otelTracer.Start(ctx, operationName, opts...)
+	wrapper.PreviousPProfCTx = ctx
+
+	labeledCtx := pprof.WithLabels(ctx, pprof.Labels(
+		"span_id", Number2String(wrapper.SpanContext().SpanID()),
+		"trace_id", Number2String(wrapper.SpanContext().TraceID()),
+		"operation_name", operationName,
+		//"runtime-id", runtimeID,
+	))
+	pprof.SetGoroutineLabels(labeledCtx)
+
+	return wrapper
+}
+
+const BaseServiceName = "go-pyroscope-demo"
 
 //go:embed movies5000.json.gz
 var moviesJSON []byte
@@ -107,19 +143,9 @@ func readMovies() ([]Movie, error) {
 	return mov, nil
 }
 
-func isENVTrue(key string) bool {
-	val := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	switch val {
-	case "", "0", "false":
-		return false
-	}
-	return true
-}
-
 func sendHtmlRequest(ctx context.Context, bodyText string, servName string) {
-	newSpan, _ := tracer.StartSpanFromContext(ctx, GetCallerFuncName(),
-		tracer.ServiceName(servName))
-	defer newSpan.Finish()
+	_, span := otelTracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.String("service", servName)))
+	defer span.End()
 
 	req, err := http.NewRequest(http.MethodGet, "https://tv189.com/", strings.NewReader(strings.Repeat(bodyText, 1000)))
 
@@ -141,7 +167,7 @@ func sendHtmlRequest(ctx context.Context, bodyText string, servName string) {
 		return
 	}
 
-	log.Println(string(body))
+	log.Println("response length: ", len(body))
 }
 
 func fibonacci(ctx context.Context, n int, servName string) int {
@@ -156,17 +182,19 @@ func fibonacci(ctx context.Context, n int, servName string) int {
 	return fibonacci(ctx, n-1, servName) + fibonacci(ctx, n-2, servName)
 }
 
+func Number2String(n any) string {
+	return fmt.Sprintf("%v", n)
+}
+
 func fibonacciWithTrace(ctx context.Context, n int, servName string) int {
-	span, newCtx := tracer.StartSpanFromContext(ctx, GetCallerFuncName(),
-		tracer.ServiceName(servName))
-	defer span.Finish()
+	newCtx, span := otelTracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.String("service", servName)))
+	defer span.End()
 	return fibonacci(newCtx, n-1, servName) + fibonacci(newCtx, n-2, servName)
 }
 
 func httpReqWithTrace(ctx context.Context) {
-	span, newCtx := tracer.StartSpanFromContext(ctx, GetCallerFuncName(),
-		tracer.ServiceName(getNextServName()))
-	defer span.Finish()
+	newCtx, span := otelTracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.String("service", getNextServName())))
+	defer span.End()
 
 	bodyText := `
 黄河远上白云间，一片孤城万仞山。
@@ -180,39 +208,141 @@ func httpReqWithTrace(ctx context.Context) {
 	}
 }
 
+func startPyroscope() (*pyroscope.Profiler, error) {
+	runtime.SetMutexProfileFraction(5)
+	runtime.SetBlockProfileRate(5)
+
+	hostname, _ := os.Hostname()
+
+	p, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "go-pyroscope-demo",
+
+		// replace this with the address of pyroscope server
+		ServerAddress: "http://127.0.0.1:9529",
+
+		// you can disable logging by setting this to nil
+		Logger: pyroscope.StandardLogger,
+
+		// uploading interval period
+		UploadRate: time.Minute,
+
+		// you can provide static tags via a map:
+		Tags: map[string]string{
+			"service":    "go-pyroscope-demo",
+			"env":        "demo",
+			"version":    "0.0.1",
+			"host":       hostname,
+			"process_id": strconv.Itoa(os.Getpid()),
+			"runtime_id": UUID,
+		},
+
+		ProfileTypes: []pyroscope.ProfileType{
+			// these profile types are enabled by default:
+			pyroscope.ProfileCPU,
+			pyroscope.ProfileAllocObjects,
+			pyroscope.ProfileAllocSpace,
+			pyroscope.ProfileInuseObjects,
+			pyroscope.ProfileInuseSpace,
+
+			// these profile types are optional:
+			pyroscope.ProfileGoroutines,
+			pyroscope.ProfileMutexCount,
+			pyroscope.ProfileMutexDuration,
+			pyroscope.ProfileBlockCount,
+			pyroscope.ProfileBlockDuration,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to bootstrap pyroscope profiler: %w", err)
+	}
+
+	return p, nil
+}
+
 func main() {
 
-	if isENVTrue("DD_TRACE_ENABLED") {
-		tracer.Start(
-			tracer.WithUniversalVersion("v0.8.888"),
-		)
-		defer tracer.Stop()
+	os.Setenv("DD_TRACE_ENABLED", "false")
+	propagator := propagation.NewCompositeTextMapPropagator(
+		propagation.Baggage{},
+		propagation.TraceContext{},
+	)
+	otel.SetTextMapPropagator(propagator)
+
+	var UUID = uuid.NewString()
+
+	exporter, err := otlptracehttp.New(context.Background(),
+		otlptracehttp.WithEndpointURL("http://127.0.0.1:9529/otel/v1/trace"),
+		otlptracehttp.WithInsecure(),
+		otlptracehttp.WithTimeout(time.Second*15),
+	)
+	if err != nil {
+		log.Fatal("unable to init otel tracing exporter: ", err)
 	}
+	provider := tracesdk.NewTracerProvider(tracesdk.WithBatcher(exporter,
+		tracesdk.WithBatchTimeout(time.Second*3)),
+		tracesdk.WithResource(resource.NewSchemaless(
+			attribute.String("runtime_id", UUID),
+			attribute.String("service.name", "go-pyroscope-demo"),
+			attribute.String("service.version", "v0.0.1"),
+			attribute.String("service.env", "dev"),
+		)),
+	)
+	defer provider.Shutdown(context.Background())
 
-	if isENVTrue("DD_PROFILING_ENABLED") {
-		err := profiler.Start(
-			profiler.WithProfileTypes(
-				profiler.CPUProfile,
-				profiler.HeapProfile,
+	otel.SetTracerProvider(otelpyroscope.NewTracerProvider(provider))
+	otelTracer = otel.Tracer("go-pyroscope-demo")
+	log.Printf("otel tracing started....\n")
 
-				// The profiles below are disabled by default to keep overhead
-				// low, but can be enabled as needed.
-				profiler.BlockProfile,
-				profiler.MutexProfile,
-				profiler.GoroutineProfile,
-				profiler.MetricsProfile,
-			),
-		)
+	runtime.SetMutexProfileFraction(5)
+	runtime.SetBlockProfileRate(5)
+	hostname, _ := os.Hostname()
 
-		if err != nil {
-			log.Fatal(err)
-		}
+	profiler, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: "go-pyroscope-demo",
 
-		defer profiler.Stop()
+		// replace this with the address of pyroscope server
+		ServerAddress: "http://127.0.0.1:9529",
+
+		// you can disable logging by setting this to nil
+		Logger: pyroscope.StandardLogger,
+
+		// uploading interval period
+		UploadRate: time.Minute,
+
+		// you can provide static tags via a map:
+		Tags: map[string]string{
+			"service":    "go-pyroscope-demo",
+			"env":        "demo",
+			"version":    "0.0.1",
+			"host":       hostname,
+			"process_id": strconv.Itoa(os.Getpid()),
+			"runtime_id": UUID,
+		},
+
+		ProfileTypes: []pyroscope.ProfileType{
+			// these profile types are enabled by default:
+			pyroscope.ProfileCPU,
+			pyroscope.ProfileAllocObjects,
+			pyroscope.ProfileAllocSpace,
+			pyroscope.ProfileInuseObjects,
+			pyroscope.ProfileInuseSpace,
+
+			// these profile types are optional:
+			pyroscope.ProfileGoroutines,
+			pyroscope.ProfileMutexCount,
+			pyroscope.ProfileMutexDuration,
+			pyroscope.ProfileBlockCount,
+			pyroscope.ProfileBlockDuration,
+		},
+	})
+	if err != nil {
+		log.Fatal("unable to bootstrap pyroscope profiler: ", err)
 	}
+	defer profiler.Stop()
+	log.Printf("pyroscope profiler started....\n")
 
 	router := gin.New()
-	//router.Use(gintrace.Middleware("go-profiling-demo"))
+	//router.Use(gintrace.Middleware("go-pyroscope-demo"))
 
 	// Access-Control-*
 	router.Use(cors.New(cors.Config{
@@ -226,22 +356,10 @@ func main() {
 	router.GET("/movies", func(ctx *gin.Context) {
 		resetServiceID()
 
-		spanCtx, err := tracer.Extract(tracer.HTTPHeadersCarrier(ctx.Request.Header))
-		if err != nil {
-			log.Printf("unable to extract span context from request header: %s", err)
-		}
+		newCtx := otel.GetTextMapPropagator().Extract(ctx.Request.Context(), propagation.HeaderCarrier(ctx.Request.Header))
 
-		if spanCtx != nil {
-			spanCtx.ForeachBaggageItem(func(k, v string) bool {
-				log.Printf("span context extracted key value %s: %s\n", k, v)
-				return true
-			})
-		}
-
-		span := tracer.StartSpan("get_movies", tracer.ChildOf(spanCtx),
-			tracer.ServiceName(getNextServName()))
-		newCtx := tracer.ContextWithSpan(ctx.Request.Context(), span)
-		defer span.Finish()
+		spanCtx, span := otelTracer.Start(newCtx, "/movies")
+		defer span.End()
 
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -251,12 +369,12 @@ func main() {
 			defer wg.Done()
 			param := 42
 			log.Printf("fibonacci(%d) = %d\n", param, fibonacci(ctx, param, getNextServName()))
-		}(newCtx)
+		}(spanCtx)
 
 		go func(ctx context.Context) {
 			defer wg.Done()
 			httpReqWithTrace(ctx)
-		}(newCtx)
+		}(spanCtx)
 
 		q := ctx.Request.FormValue("q")
 
@@ -321,30 +439,6 @@ func main() {
 			ctx.Writer.WriteHeader(http.StatusInternalServerError)
 		}
 		wg.Wait()
-	})
-
-	pprofIndex := func(ctx *gin.Context) {
-		pprof.Index(ctx.Writer, ctx.Request)
-	}
-
-	router.GET("/debug/pprof", func(ctx *gin.Context) {
-		ctx.Redirect(http.StatusMovedPermanently, "/debug/pprof/")
-	})
-
-	pg := router.Group("/debug/pprof")
-	pg.GET("/", pprofIndex)
-	pg.GET("/:name", pprofIndex)
-	pg.GET("/cmdline", func(ctx *gin.Context) {
-		pprof.Cmdline(ctx.Writer, ctx.Request)
-	})
-	pg.GET("/profile", func(ctx *gin.Context) {
-		pprof.Profile(ctx.Writer, ctx.Request)
-	})
-	pg.GET("/symbol", func(ctx *gin.Context) {
-		pprof.Symbol(ctx.Writer, ctx.Request)
-	})
-	pg.GET("/trace", func(ctx *gin.Context) {
-		pprof.Trace(ctx.Writer, ctx.Request)
 	})
 
 	if err := http.ListenAndServe(":8080", router); err != nil {
