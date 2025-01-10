@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,38 +34,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-var UUID = uuid.NewString()
-var otelTracer trace.Tracer
-
-type OtelTraceWrapper struct {
-	trace.Span
-	SpanCtx          context.Context
-	PreviousPProfCTx context.Context
-}
-
-func (d *OtelTraceWrapper) Finish() {
-	d.Span.End()
-	if d.PreviousPProfCTx != nil {
-		pprof.SetGoroutineLabels(d.PreviousPProfCTx)
-	}
-}
-
-// StartSpanFromContext otel span wrapper
-func StartSpanFromContext(ctx context.Context, operationName string, opts ...trace.SpanStartOption) *OtelTraceWrapper {
-	wrapper := new(OtelTraceWrapper)
-	wrapper.SpanCtx, wrapper.Span = otelTracer.Start(ctx, operationName, opts...)
-	wrapper.PreviousPProfCTx = ctx
-
-	labeledCtx := pprof.WithLabels(ctx, pprof.Labels(
-		"span_id", Number2String(wrapper.SpanContext().SpanID()),
-		"trace_id", Number2String(wrapper.SpanContext().TraceID()),
-		"operation_name", operationName,
-		//"runtime-id", runtimeID,
-	))
-	pprof.SetGoroutineLabels(labeledCtx)
-
-	return wrapper
-}
+var (
+	UUID       = uuid.NewString()
+	otelTracer trace.Tracer
+)
 
 const BaseServiceName = "go-pyroscope-demo"
 
@@ -147,7 +118,7 @@ func sendHtmlRequest(ctx context.Context, bodyText string, servName string) {
 	_, span := otelTracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.String("service", servName)))
 	defer span.End()
 
-	req, err := http.NewRequest(http.MethodGet, "https://tv189.com/", strings.NewReader(strings.Repeat(bodyText, 1000)))
+	req, err := http.NewRequest(http.MethodGet, "https://toutiao.com/", strings.NewReader(strings.Repeat(bodyText, 1000)))
 
 	if err != nil {
 		log.Println(err)
@@ -174,21 +145,16 @@ func fibonacci(ctx context.Context, n int, servName string) int {
 	if n <= 2 {
 		return 1
 	}
-	if n%31 == 0 {
-		return fibonacciWithTrace(ctx, n-1, servName) + fibonacciWithTrace(ctx, n-2, servName)
-	} else if n%37 == 0 {
-		return fibonacciWithTrace(ctx, n-1, servName) + fibonacciWithTrace(ctx, n-2, servName)
+	if n%37 == 0 {
+		return fibonacciWithTrace(ctx, n-1, servName) + fibonacci(ctx, n-2, servName)
 	}
 	return fibonacci(ctx, n-1, servName) + fibonacci(ctx, n-2, servName)
-}
-
-func Number2String(n any) string {
-	return fmt.Sprintf("%v", n)
 }
 
 func fibonacciWithTrace(ctx context.Context, n int, servName string) int {
 	newCtx, span := otelTracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.String("service", servName)))
 	defer span.End()
+	time.Sleep(time.Millisecond * 700)
 	return fibonacci(newCtx, n-1, servName) + fibonacci(newCtx, n-2, servName)
 }
 
@@ -205,58 +171,8 @@ func httpReqWithTrace(ctx context.Context) {
 
 	for i := 0; i < 10; i++ {
 		sendHtmlRequest(newCtx, bodyText, getCurServName())
+		time.Sleep(time.Second * 3)
 	}
-}
-
-func startPyroscope() (*pyroscope.Profiler, error) {
-	runtime.SetMutexProfileFraction(5)
-	runtime.SetBlockProfileRate(5)
-
-	hostname, _ := os.Hostname()
-
-	p, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: "go-pyroscope-demo",
-
-		// replace this with the address of pyroscope server
-		ServerAddress: "http://127.0.0.1:9529",
-
-		// you can disable logging by setting this to nil
-		Logger: pyroscope.StandardLogger,
-
-		// uploading interval period
-		UploadRate: time.Minute,
-
-		// you can provide static tags via a map:
-		Tags: map[string]string{
-			"service":    "go-pyroscope-demo",
-			"env":        "demo",
-			"version":    "0.0.1",
-			"host":       hostname,
-			"process_id": strconv.Itoa(os.Getpid()),
-			"runtime_id": UUID,
-		},
-
-		ProfileTypes: []pyroscope.ProfileType{
-			// these profile types are enabled by default:
-			pyroscope.ProfileCPU,
-			pyroscope.ProfileAllocObjects,
-			pyroscope.ProfileAllocSpace,
-			pyroscope.ProfileInuseObjects,
-			pyroscope.ProfileInuseSpace,
-
-			// these profile types are optional:
-			pyroscope.ProfileGoroutines,
-			pyroscope.ProfileMutexCount,
-			pyroscope.ProfileMutexDuration,
-			pyroscope.ProfileBlockCount,
-			pyroscope.ProfileBlockDuration,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("unable to bootstrap pyroscope profiler: %w", err)
-	}
-
-	return p, nil
 }
 
 func main() {
@@ -267,8 +183,6 @@ func main() {
 		propagation.TraceContext{},
 	)
 	otel.SetTextMapPropagator(propagator)
-
-	var UUID = uuid.NewString()
 
 	exporter, err := otlptracehttp.New(context.Background(),
 		otlptracehttp.WithEndpointURL("http://127.0.0.1:9529/otel/v1/trace"),
